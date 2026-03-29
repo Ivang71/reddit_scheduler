@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 import nodriver as uc
 import requests
 import websockets
+
+import generate_posts
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +34,40 @@ def profile_dir(profile: str) -> str:
 
 def token_path(profile: str) -> str:
     return os.path.join(ROOT, f"tokens_{profile}.json")
+
+
+def cleanup_profile(profile: str) -> None:
+    user_data = profile_dir(profile)
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        path = os.path.join(user_data, name)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    subprocess.run(
+        ["pkill", "-f", user_data],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
+async def start_browser(profile: str):
+    user_data = profile_dir(profile)
+    last_error = None
+    for attempt in range(2):
+        try:
+            return await asyncio.wait_for(
+                uc.start(user_data_dir=user_data, no_sandbox=True, headless=False),
+                timeout=20,
+            )
+        except Exception as e:
+            last_error = e
+            if attempt == 0:
+                cleanup_profile(profile)
+                await asyncio.sleep(1)
+    raise last_error
 
 
 def parse_start_time(value: str) -> datetime:
@@ -86,7 +123,7 @@ def is_logged_in(tokens: dict) -> bool:
 async def open_login(profile: str) -> None:
     user_data = profile_dir(profile)
     os.makedirs(user_data, exist_ok=True)
-    browser = await uc.start(user_data_dir=user_data, no_sandbox=True, headless=False)
+    browser = await start_browser(profile)
     try:
         page = await browser.get("https://www.reddit.com/login", new_window=True)
         await page.activate()
@@ -114,10 +151,7 @@ async def get_reddit_cookies(browser) -> list[str]:
 
 
 async def extract_tokens(profile: str, subreddit: str) -> dict:
-    browser = await asyncio.wait_for(
-        uc.start(user_data_dir=profile_dir(profile), no_sandbox=True, headless=False),
-        timeout=20,
-    )
+    browser = await start_browser(profile)
     try:
         print("opening reddit", flush=True)
         page = await asyncio.wait_for(
@@ -250,16 +284,22 @@ def schedule_posts(profile: str, tokens: dict, count: int, interval: int, start_
 
 def main() -> None:
     args = parse_args()
+    print("generating posts", flush=True)
+    generate_posts.run(args.profile, args.login)
+    print("posts generated", flush=True)
     account = load_account(args.profile)
     needs_login = args.login or not os.path.isdir(os.path.join(profile_dir(args.profile), "Default"))
     if needs_login:
+        print("reddit login required", flush=True)
         uc.loop().run_until_complete(open_login(args.profile))
     tokens = uc.loop().run_until_complete(extract_tokens(args.profile, account["subreddit"]))
     if not is_logged_in(tokens):
+        print("reddit tokens incomplete, reopening login", flush=True)
         uc.loop().run_until_complete(open_login(args.profile))
         tokens = uc.loop().run_until_complete(extract_tokens(args.profile, account["subreddit"]))
     if not is_logged_in(tokens):
         raise SystemExit("login missing or expired")
+    print("scheduling reddit posts", flush=True)
     schedule_posts(args.profile, tokens, args.count, args.interval, args.start_time)
 
 
